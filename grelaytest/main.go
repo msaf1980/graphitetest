@@ -356,7 +356,7 @@ func ParseArgs() (Config, error) {
 	if conTimeout < 1 {
 		return config, errors.New(fmt.Sprintf("Invalid TCP connection timeout value: %d\n", conTimeout))
 	}
-	if config.UWorkers < 1 {
+	if config.UWorkers < 0 {
 		return config, errors.New(fmt.Sprintf("Invalid UDP workers value: %d\n", config.Workers))
 	}
 	if config.UCount < 1 {
