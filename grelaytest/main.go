@@ -119,7 +119,7 @@ func TcpWorker(id int, config Config, out chan<- Result) {
 		ch <- *r
 	}(out)
 
-	metricPrefix := fmt.Sprintf("TCP %s.worker%d", config.MetricPrefix, id)
+	metricPrefix := fmt.Sprintf("%s.worker%d", config.MetricPrefix, id)
 	cb.Await()
 	log.Printf("Started TCP worker %d\n", id)
 
@@ -223,14 +223,13 @@ func printStat(s summaryResult, prefix string, duration time.Duration, rateName 
 	}
 }
 
-func tcpStat(stat []Result, con int, testDuration time.Duration, duration time.Duration, config Config) {
+func tcpStat(stat []Result, con int, duration time.Duration, config Config) {
 	var cps time.Duration
 	if duration > 0 {
 		cps = time.Duration(con) * time.Second / duration
 	}
-	log.Printf("TCP Workers: %d, duration: %.2f sec, total connections: %d / %.2f sec = %d cps",
-		config.Workers, float64(testDuration)/float64(time.Second),
-		con, float64(duration)/float64(time.Second), cps)
+	log.Printf("TCP Workers: %d, total connections: %d / %.2f sec = %d cps",
+		config.Workers, con, float64(duration)/float64(time.Second), cps)
 
 	conSuccess := make([]float64, con)
 	conSendTime := make([]float64, config.Count*config.Workers)
@@ -387,7 +386,7 @@ func main() {
 
 	statSize := config.Count*config.Workers/config.MetricPerCon +
 		config.Count*config.Workers%config.MetricPerCon +
-		config.UCount*config.UWorkers
+		config.UCount*config.UWorkers + 1
 	bufSize := maxBuf
 	if statSize < maxBuf {
 		bufSize = statSize
@@ -415,10 +414,8 @@ func main() {
 	con := 0
 	ucon := 0
 	var (
-		testDuration  time.Duration
-		duration      time.Duration
-		testUduration time.Duration
-		uduration     time.Duration
+		duration  time.Duration
+		uduration time.Duration
 	)
 
 LOOP:
@@ -429,12 +426,12 @@ LOOP:
 				if r.Tcp {
 					workers--
 					if workers == 0 {
-						testDuration = time.Since(start)
+						duration = time.Since(start)
 					}
 				} else {
 					uworkers--
 					if uworkers == 0 {
-						testUduration = time.Since(start)
+						uduration = time.Since(start)
 					}
 				}
 				if workers <= 0 && uworkers <= 0 {
@@ -451,28 +448,11 @@ LOOP:
 		}
 	}
 
-	for i := range stat {
-		if stat[i].Tcp {
-			if stat[i].Connect.Time > 0 {
-				duration += stat[i].Duration()
-			} else {
-				duration -= stat[i].Connect.Time
-			}
-		} else {
-			if stat[i].Connect.Time > 0 {
-				uduration += stat[i].Duration()
-			} else {
-				uduration -= stat[i].Connect.Time
-			}
-		}
-	}
-
-	tcpStat(stat, con, testDuration, duration, config)
+	tcpStat(stat, con, duration, config)
 
 	if uduration > 0 {
-		log.Printf("UDP Workers: %d, duration %.2f sec, total send: %d / %.2f sec = %d rps",
-			config.UWorkers, float64(testUduration)/float64(time.Second),
-			ucon, float64(uduration)/float64(time.Second),
+		log.Printf("UDP Workers: %d, total send: %d / %.2f sec = %d rps",
+			config.UWorkers, ucon, float64(uduration)/float64(time.Second),
 			time.Duration(ucon)*time.Second/uduration)
 	}
 }
