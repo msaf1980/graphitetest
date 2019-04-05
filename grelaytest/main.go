@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,21 +18,26 @@ const (
 )
 
 var cb *CB
+var wg sync.WaitGroup
+
+var running = false
 
 type Config struct {
-	Addr         string
-	Connections  int
-	Workers      int
+	Addr string
+	//Connections int
+	Workers      int // TCP Workers
 	Count        int
 	MetricPerCon int
 	BatchSend    int
+	SendDelay    time.Duration
 	ConTimeout   time.Duration
 	SendTimeout  time.Duration
-	UWorkers     int
+	UWorkers     int // UDP Workers
 	UCount       int
 	UBatchSend   int
-	SendDelay    time.Duration
-	MetricPrefix string
+
+	MetricPrefix string // Prefix for generated metric name
+	Verbose      bool
 }
 
 type ConStat struct {
@@ -108,104 +112,6 @@ func getStat(data []float64) summaryResult {
 	r.P90, _ = stats.Percentile(data, 0.9)
 	r.P95, _ = stats.Percentile(data, 0.95)
 	return r
-}
-
-func TcpWorker(id int, config Config, out chan<- Result) {
-	r := ResultNew(id, true, config.MetricPerCon)
-
-	defer func(ch chan<- Result) {
-		r.ResultZero()
-		r.Connect.Time = 0
-		ch <- *r
-	}(out)
-
-	metricPrefix := fmt.Sprintf("%s.worker%d", config.MetricPrefix, id)
-	cb.Await()
-	log.Printf("Started TCP worker %d\n", id)
-
-	for i := 0; i < config.Count; i += config.MetricPerCon {
-		r.ResultZero()
-		start := time.Now()
-		con, conError := net.DialTimeout("tcp", config.Addr, config.ConTimeout)
-		duration := time.Since(start)
-		if conError == nil {
-			rw := bufio.NewReadWriter(bufio.NewReader(con), bufio.NewWriter(con))
-			r.Connect.Time = duration
-			r.Connect.Error = nil
-			timeStamp := time.Now().Unix()
-			n := i
-		LOOP_INT:
-			for j := 0; j < config.MetricPerCon && n < config.Count; j++ {
-				metricString := fmt.Sprintf("%s.%d %d %d\n", metricPrefix, i, n, timeStamp)
-				con.SetDeadline(time.Now().Add(config.SendTimeout))
-				start := time.Now()
-				sended, err := rw.WriteString(metricString)
-				duration := time.Since(start)
-				r.Send[j].Size = sended
-				if err == nil {
-					r.Send[j].Time = duration
-				} else {
-					r.Send[j].Time = -duration
-					r.Send[j].Error = err
-					con.Close()
-					break LOOP_INT
-				}
-				n++
-				if config.SendDelay > 0 {
-					time.Sleep(config.SendDelay)
-				}
-			}
-			con.Close()
-		} else {
-			r.Connect.Error = conError
-			r.Connect.Time = -duration
-			if config.SendDelay > 0 {
-				time.Sleep(config.SendDelay)
-			}
-		}
-		out <- *r
-	}
-	log.Printf("Ended TCP worker %d, %d metrics\n", id, config.Count)
-}
-
-func UDPWorker(id int, config Config, out chan<- Result) {
-	r := ResultNew(id, false, 1)
-
-	defer func(ch chan<- Result) {
-		r.ResultZero()
-		r.Connect.Time = 0
-		ch <- *r
-	}(out)
-
-	metricPrefix := fmt.Sprintf("%s.udpworker%d", config.MetricPrefix, id)
-	cb.Await()
-	log.Printf("Started UDP worker %d\n", id)
-
-	for i := 0; i < config.UCount; i++ {
-		r.ResultZero()
-		timeStamp := time.Now().Unix()
-		metricString := fmt.Sprintf("%s.%d %d %d\n", metricPrefix, i, i, timeStamp)
-
-		start := time.Now()
-		con, conError := net.Dial("udp", config.Addr)
-		if conError == nil {
-			fmt.Fprintf(con, metricString)
-			duration := time.Since(start)
-			r.Connect.Time = duration
-			r.Connect.Error = nil
-			r.Send[0].Size = len(metricString)
-			con.Close()
-		} else {
-			r.Connect.Time = -time.Since(start)
-			r.Connect.Error = conError
-		}
-		if config.SendDelay > 0 {
-			time.Sleep(config.SendDelay)
-		}
-
-		out <- *r
-	}
-	log.Printf("Ended UDP worker %d, %d metrics\n", id, config.Count)
 }
 
 func printStat(s summaryResult, prefix string, duration time.Duration, rateName string) {
@@ -328,6 +234,8 @@ func ParseArgs() (Config, error) {
 
 	flag.IntVar(&sendDelay, "delay", 0, "send delay (ms)")
 
+	flag.BoolVar(&config.Verbose, "verbose", false, "verbose")
+
 	flag.Parse()
 	if host == "" {
 		host = "127.0.0.1"
@@ -392,12 +300,12 @@ func main() {
 		bufSize = statSize
 	}
 
+	wg.Add(config.Workers + config.UWorkers)
+
 	result := make(chan Result, bufSize)
 	workers := config.Workers
 	uworkers := config.UWorkers
 	stat := make([]Result, statSize)
-
-	log.Printf("Starting workers: %d\n", config.Workers)
 
 	cb = NewCB(config.Workers + config.UWorkers + 1)
 
@@ -410,6 +318,7 @@ func main() {
 
 	start := time.Now()
 	cb.Await()
+	log.Printf("Starting TCP workers: %d, UDP %d\n", config.Workers, config.UWorkers)
 
 	con := 0
 	ucon := 0
