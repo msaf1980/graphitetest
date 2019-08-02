@@ -3,61 +3,151 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"strings"
 	"time"
 )
 
+type NetOper int
+
+const (
+	CONNECT NetOper = iota
+	SEND
+	RECV
+)
+
+var NetOperStrings = [...]string{
+	"CONNECT",
+	"SEND",
+	"RECV",
+}
+
+func NetOperToString(oper NetOper) string {
+	return NetOperStrings[oper]
+}
+
+type NetErr int
+
+const (
+	OK NetErr = iota
+	ERROR
+	EOF
+	TIMEOUT
+	LOOKUP
+	REFUSED
+	RESET
+)
+
+var NetErrStrings = [...]string{
+	"OK",
+	"ERROR",
+	"EOF",
+	"TIMEOUT",
+	"LOOKUP",
+	"REFUSED",
+	"RESET",
+}
+
+func NetErrToString(err NetErr) string {
+	return NetErrStrings[err]
+}
+
+// NetError return short network error description
+func NetError(err error) NetErr {
+	if err == nil {
+		return OK
+	}
+	if err == io.EOF {
+		return EOF
+	}
+	netErr, ok := err.(net.Error)
+	if ok {
+		if netErr.Timeout() {
+			return TIMEOUT
+		} else if strings.Contains(err.Error(), " lookup ") {
+			return LOOKUP
+		} else if strings.HasSuffix(err.Error(), ": connection refused") {
+			return REFUSED
+		} else if strings.HasSuffix(err.Error(), ": connection reset by peer") {
+			return RESET
+		} else if strings.HasSuffix(err.Error(), ": broken pipe") ||
+			strings.HasSuffix(err.Error(), "EOF") {
+			return EOF
+		}
+	}
+	return ERROR
+}
+
+type Proto int
+
+const (
+	TCP Proto = iota
+	UDP
+)
+
+var ProtoStrings = [...]string{
+	"TCP",
+	"UDP",
+}
+
+func ProtoToString(proto Proto) string {
+	return ProtoStrings[proto]
+}
+
+// ConStat connection or send statistic
 type ConStat struct {
-	Time  time.Duration
-	Error error
-	Size  int
+	Id        int
+	Proto     Proto
+	Type      NetOper
+	TimeStamp int64
+	Elapsed   int64
+	Error     NetErr
+	Size      int
 }
 
-type Result struct {
-	Id      int
-	Tcp     bool
-	Connect ConStat
-	Send    []ConStat
-}
-
-func ResultNew(id int, tcp bool, count int) *Result {
-	r := new(Result)
+func ConStatNew(id int, proto Proto) *ConStat {
+	r := new(ConStat)
 	r.Id = id
-	r.Tcp = tcp
-	r.Send = make([]ConStat, count)
+	r.Proto = proto
 	return r
 }
 
-func (r *Result) ResultZero() {
-	for i := range r.Send {
-		r.Send[i].Size = 0
-		r.Send[i].Time = 0
-		r.Send[i].Error = nil
-	}
+func (r *ConStat) ConStatZero() {
+	r.TimeStamp = 0
+	r.Size = 0
+	r.Elapsed = 0
+	r.Error = OK
 }
 
-func (r *Result) Duration() time.Duration {
-	if r.Connect.Time <= 0 {
-		return 0
-	}
-	d := r.Connect.Time
-	for i := range r.Send {
-		if r.Send[i].Time > 0 {
-			d += r.Send[i].Time
-		}
-	}
-	return d
-}
+//func (r *Result) Duration() time.Duration {
+//if r.Connect.Time <= 0 {
+//return 0
+//}
+//d := r.Connect.Time
+//for i := range r.Send {
+//if r.Send[i].Time > 0 {
+//d += r.Send[i].Time
+//}
+//}
+//return d
+//}
 
 type Worker struct {
-	out      chan string   // A channel to communicate to the routine
-	Interval time.Duration // The interval with which to run the Action
-	period   time.Duration // The actual period of the wait
+	out chan string // A channel to communicate to the routine
+	//Interval time.Duration // The interval with which to run the Action
+	//period   time.Duration // The actual period of the wait
 }
 
-func TcpWorker(id int, config Config, out chan<- Result) {
-	r := ResultNew(id, true, config.MetricPerCon)
+func TcpWorker(id int, config config, out chan ConStat) {
+	var err error
+	r := ConStatNew(id, TCP)
+
+	defer func(ch chan<- ConStat) {
+		r.ConStatZero()
+		ch <- *r
+	}(out)
 
 	metricPrefix := fmt.Sprintf("%s.worker%d", config.MetricPrefix, id)
 	cb.Await()
@@ -65,91 +155,101 @@ func TcpWorker(id int, config Config, out chan<- Result) {
 		log.Printf("Started TCP worker %d\n", id)
 	}
 
+	var count int64
 	for running {
-		r.ResultZero()
+		//r.ResultZero()
 		start := time.Now()
 		con, conError := net.DialTimeout("tcp", config.Addr, config.ConTimeout)
-		duration := time.Since(start)
+		r.Elapsed = time.Since(start).Nanoseconds()
+		r.Type = CONNECT
+		r.Error = NetError(conError)
+		r.TimeStamp = start.UnixNano()
+		r.Size = 0
+		out <- *r
 		if conError == nil {
 			rw := bufio.NewReadWriter(bufio.NewReader(con), bufio.NewWriter(con))
-			r.Connect.Time = duration
-			r.Connect.Error = nil
-			timeStamp := time.Now().Unix()
-			n := i
 		LOOP_INT:
-			for j := 0; j < config.MetricPerCon && n < config.Count; j++ {
-				metricString := fmt.Sprintf("%s.%d %d %d\n", metricPrefix, i, n, timeStamp)
-				con.SetDeadline(time.Now().Add(config.SendTimeout))
+			for j := 0; running && j < config.MetricPerCon; j++ {
 				start := time.Now()
-				sended, err := rw.WriteString(metricString)
-				duration := time.Since(start)
-				r.Send[j].Size = sended
+				metricString := fmt.Sprintf("%s.%d %d %d\n", metricPrefix, id, j, start.Unix())
+				con.SetDeadline(start.Add(config.SendTimeout))
+				r.Size, err = rw.WriteString(metricString)
 				if err == nil {
-					r.Send[j].Time = duration
+					err = rw.Flush()
+				}
+				r.Elapsed = time.Since(start).Nanoseconds()
+				r.Type = SEND
+				r.Error = NetError(err)
+				r.TimeStamp = start.UnixNano()
+				out <- *r
+				if err == nil {
+					count++
 				} else {
-					r.Send[j].Time = -duration
-					r.Send[j].Error = err
 					con.Close()
 					break LOOP_INT
 				}
-				n++
 				if config.SendDelay > 0 {
 					time.Sleep(config.SendDelay)
 				}
 			}
 			con.Close()
 		} else {
-			r.Connect.Error = conError
-			r.Connect.Time = -duration
 			if config.SendDelay > 0 {
 				time.Sleep(config.SendDelay)
 			}
 		}
-		out <- *r
 	}
 	if config.Verbose {
-		log.Printf("Ended TCP worker %d, %d metrics\n", id, config.Count)
+		log.Printf("Ended TCP worker %d, %d metrics\n", id, count)
 	}
 }
 
-func UDPWorker(id int, config Config, out chan<- Result) {
-	r := ResultNew(id, false, 1)
+func UDPWorker(id int, config config, out chan<- ConStat) {
+	r := ConStatNew(id, UDP)
+	r.Type = SEND
 
-	defer func(ch chan<- Result) {
-		r.ResultZero()
-		r.Connect.Time = 0
+	defer func(ch chan<- ConStat) {
+		r.ConStatZero()
 		ch <- *r
 	}(out)
 
 	metricPrefix := fmt.Sprintf("%s.udpworker%d", config.MetricPrefix, id)
 	cb.Await()
-	log.Printf("Started UDP worker %d\n", id)
+	if config.Verbose {
+		log.Printf("Started UDP worker %d\n", id)
+	}
 
-	for i := 0; i < config.UCount; i++ {
-		r.ResultZero()
-		timeStamp := time.Now().Unix()
-		metricString := fmt.Sprintf("%s.%d %d %d\n", metricPrefix, i, i, timeStamp)
+	var count int64
+	for running {
+		for i := 0; running && i < 1000; i++ {
+			timeStamp := time.Now().Unix()
+			metricString := fmt.Sprintf("%s.%d %d %d\n", metricPrefix, i, i, timeStamp)
 
-		start := time.Now()
-		con, conError := net.Dial("udp", config.Addr)
-		if conError == nil {
-			fmt.Fprintf(con, metricString)
-			duration := time.Since(start)
-			r.Connect.Time = duration
-			r.Connect.Error = nil
-			r.Send[0].Size = len(metricString)
-			con.Close()
-		} else {
-			r.Connect.Time = -time.Since(start)
-			r.Connect.Error = conError
+			start := time.Now()
+			con, conError := net.Dial("udp", config.Addr)
+			if conError == nil {
+				sended, err := fmt.Fprintf(con, metricString)
+				con.Close()
+				r.Error = NetError(err)
+				r.Size = sended
+				if err == nil {
+					count++
+				}
+			} else {
+				r.Error = NetError(conError)
+				r.Size = 0
+			}
+			r.Elapsed = time.Since(start).Nanoseconds()
+			r.TimeStamp = start.UnixNano()
+			out <- *r
+			if config.SendDelay > 0 {
+				time.Sleep(config.SendDelay)
+			}
+
+			out <- *r
 		}
-		if config.SendDelay > 0 {
-			time.Sleep(config.SendDelay)
-		}
-
-		out <- *r
 	}
 	if config.Verbose {
-		log.Printf("Ended UDP worker %d, %d metrics\n", id, config.Count)
+		log.Printf("Ended UDP worker %d, %d metrics\n", id, count)
 	}
 }

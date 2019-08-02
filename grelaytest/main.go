@@ -1,240 +1,80 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/montanaflynn/stats"
 	"log"
-	"net"
 	"os"
-	"regexp"
-	"sort"
 	"time"
+
+	"runtime/pprof"
+
+	"github.com/msaf1980/cyclicbarrier"
 )
 
 const (
 	maxBuf = 1000
 )
 
-var cb *CB
-var wg sync.WaitGroup
+var cb *cyclicbarrier.CyclicBarrier
 
-var running = false
+var running = true
 
-type Config struct {
+type config struct {
 	Addr string
 	//Connections int
 	Workers      int // TCP Workers
-	Count        int
+	Duration     time.Duration
 	MetricPerCon int
 	BatchSend    int
 	SendDelay    time.Duration
 	ConTimeout   time.Duration
 	SendTimeout  time.Duration
 	UWorkers     int // UDP Workers
-	UCount       int
 	UBatchSend   int
 
 	MetricPrefix string // Prefix for generated metric name
 	Verbose      bool
+
+	StatFile string // write connections stat to file
+	CPUProf  string // write cpu profile info to file
 }
 
-type ConStat struct {
-	Time  time.Duration
-	Error error
-	Size  int
-}
+const header = "timestamp\tConId\tProto\tType\tStatus\tElapsed\tSize\n"
 
-type Result struct {
-	Id      int
-	Tcp     bool
-	Connect ConStat
-	Send    []ConStat
-}
-
-func ResultNew(id int, tcp bool, count int) *Result {
-	r := new(Result)
-	r.Id = id
-	r.Tcp = tcp
-	r.Send = make([]ConStat, count)
-	return r
-}
-
-func (r *Result) ResultZero() {
-	for i := range r.Send {
-		r.Send[i].Size = 0
-		r.Send[i].Time = 0
-		r.Send[i].Error = nil
-	}
-}
-
-func (r *Result) Duration() time.Duration {
-	if r.Connect.Time <= 0 {
-		return 0
-	}
-	d := r.Connect.Time
-	for i := range r.Send {
-		if r.Send[i].Time > 0 {
-			d += r.Send[i].Time
-		}
-	}
-	return d
-}
-
-type summaryResult struct {
-	Count  int
-	Avg    float64
-	Min    float64
-	Max    float64
-	Median float64
-	P75    float64
-	P90    float64
-	P95    float64
-}
-
-func copyFloatSlice(src []float64, n int) []float64 {
-	dst := make([]float64, n)
-	for i := 0; i < n; i++ {
-		dst[i] = src[i]
-	}
-	return dst
-}
-
-func getStat(data []float64) summaryResult {
-	var r summaryResult
-	sort.Float64s(data)
-	r.Count = len(data)
-	r.Min, _ = stats.Min(data)
-	r.Max, _ = stats.Max(data)
-	r.Median, _ = stats.Median(data)
-	r.P75, _ = stats.Percentile(data, 0.75)
-	r.P90, _ = stats.Percentile(data, 0.9)
-	r.P95, _ = stats.Percentile(data, 0.95)
-	return r
-}
-
-func printStat(s summaryResult, prefix string, duration time.Duration, rateName string) {
-	if s.Count == 0 {
-		fmt.Printf("%s: %d\n", prefix, s.Count)
-	} else {
-		var rate string
-		if duration > 0 {
-			rate = fmt.Sprintf(" (%d %s)", time.Duration(s.Count)*time.Second/duration, rateName)
-		}
-		fmt.Printf("%s: %d%s, time min %.3f, max %.3f, median %.3f, p75 %.3f, p90 %.3f, p95 %.3f\n",
-			prefix, s.Count, rate,
-			s.Min, s.Max, s.Median,
-			s.P75, s.P90, s.P95)
-	}
-}
-
-func tcpStat(stat []Result, con int, duration time.Duration, config Config) {
-	var cps time.Duration
-	if duration > 0 {
-		cps = time.Duration(con) * time.Second / duration
-	}
-	log.Printf("TCP Workers: %d, total connections: %d / %.2f sec = %d cps",
-		config.Workers, con, float64(duration)/float64(time.Second), cps)
-
-	conSuccess := make([]float64, con)
-	conSendTime := make([]float64, config.Count*config.Workers)
-	conSendSize := make([]float64, config.Count*config.Workers)
-
-	conSendErr := 0
-	conRefused := 0
-	conTimeout := 0
-	conResolve := 0
-	conError := 0
-
-	ncon := 0
-	nsend := 0
-
-	for i := 0; i < con; i++ {
-		if !stat[i].Tcp {
-			continue
-		}
-		if stat[i].Connect.Error == nil {
-			//log.Printf("ID %d connect %.2f ms", stat[i].Id, float64(stat[i].Connect.Time)/float64(time.Millisecond))
-			conSuccess[ncon] = float64(stat[i].Connect.Time) / float64(time.Millisecond)
-			ncon++
-			var sendTime time.Duration
-			var sendSize int
-		LOOP_INT:
-			for j := range stat[i].Send {
-				err := stat[i].Send[j].Error
-				if err != nil {
-					conSendErr++
-					break LOOP_INT
-				} else if stat[i].Send[j].Time == 0 {
-					break LOOP_INT
-				} else {
-					//fmt.Printf("Ok: time %d, size %d\n", stat[i].Send[j].Time/time.Microsecond, stat[i].Send[j].Size)
-					sendTime += stat[i].Send[j].Time
-					sendSize += stat[i].Send[j].Size
-				}
-			}
-			if sendTime > 0 {
-				conSendTime[nsend] = float64(sendTime)
-				conSendSize[nsend] = float64(sendSize)
-				nsend++
-			}
-		} else {
-			//log.Printf("ID %d connect error %.2f ms, %s\n", stat[i].Id, float64(-stat[i].Connect.Time)/float64(time.Millisecond), stat[i].Connect.Error)
-			err := stat[i].Connect.Error
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				conTimeout++
-			} else if match, _ := regexp.MatchString(".*lookup.*", err.Error()); match {
-				conResolve++
-			} else if match, _ := regexp.MatchString(".*connection refused.*", err.Error()); match {
-				conRefused++
-			} else {
-				conError++
-			}
-		}
-	}
-	conSuccess = copyFloatSlice(conSuccess, ncon)
-	conResult := getStat(conSuccess)
-	printStat(conResult, "connection success", duration, "cps")
-	fmt.Printf("connection error: refused %d, timeout %d, lookup %d, other %d\n",
-		conRefused, conTimeout, conResolve, conError)
-
-	conSendTime = copyFloatSlice(conSendTime, nsend)
-	conSendTimeRes := getStat(conSendTime)
-	printStat(conSendTimeRes, "send", duration, "rps")
-
-	conSendSize = copyFloatSlice(conSendSize, nsend)
-	conSendSizeRes := getStat(conSendSize)
-	printStat(conSendSizeRes, "size", 0, "")
-	fmt.Printf("send error: %d\n", conSendErr)
-}
-
-func ParseArgs() (Config, error) {
+func ParseArgs() (config, error) {
 	var (
-		config      Config
+		config      config
 		conTimeout  int
 		sendTimeout int
 		sendDelay   int
 		host        string
 		port        int
+		duration    string
+		err         error
 	)
 
 	flag.StringVar(&host, "host", "127.0.0.1", "hostname")
 	flag.IntVar(&port, "port", 2003, "port")
 	flag.IntVar(&config.Workers, "workers", 10, "TCP workers")
-	flag.IntVar(&config.Count, "count", 1000, "total sended metrics per TCP worker")
+	flag.StringVar(&duration, "duration", "60s", "total test duration")
 	flag.IntVar(&config.MetricPerCon, "metric", 1, "send metric count in one TCP connection")
 	//flag.IntVar(&config.BatchSend, "batch", 1, "send metric count in one TCP send")
-	flag.IntVar(&conTimeout, "t", 10, "TCP connect timeout (ms)")
-	flag.IntVar(&sendTimeout, "s", 100, "TCP send timeout (ms)")
+	flag.IntVar(&conTimeout, "t", 100, "TCP connect timeout (ms)")
+	flag.IntVar(&sendTimeout, "s", 500, "TCP send timeout (ms)")
 	flag.IntVar(&config.UWorkers, "uworkers", 0, "UDP workers (default 0)")
-	flag.IntVar(&config.UCount, "ucount", 1000, "total sended metrics per UDP worker")
 	//flag.IntVar(&config.UBatchSend, "ubatch", 1, "send metric count in one UDP send")
 	flag.StringVar(&config.MetricPrefix, "prefix", "test", "metric prefix")
 
 	flag.IntVar(&sendDelay, "delay", 0, "send delay (ms)")
 
 	flag.BoolVar(&config.Verbose, "verbose", false, "verbose")
+
+	flag.StringVar(&config.StatFile, "stat", "grelaytest.csv", "stat file (appended)")
+
+	flag.StringVar(&config.CPUProf, "cpuprofile", "", "write cpu profile to file")
 
 	flag.Parse()
 	if host == "" {
@@ -245,9 +85,6 @@ func ParseArgs() (Config, error) {
 	}
 	if config.Workers < 1 {
 		return config, errors.New(fmt.Sprintf("Invalid TCP workers value: %d\n", config.Workers))
-	}
-	if config.Count < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid TCP count value: %d\n", config.Count))
 	}
 	if config.MetricPerCon < 1 {
 		return config, errors.New(fmt.Sprintf("Invalid TCP metric value: %d\n", config.MetricPerCon))
@@ -266,8 +103,9 @@ func ParseArgs() (Config, error) {
 	if config.UWorkers < 0 {
 		return config, errors.New(fmt.Sprintf("Invalid UDP workers value: %d\n", config.Workers))
 	}
-	if config.UCount < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid UDP count value: %d\n", config.Count))
+	config.Duration, err = time.ParseDuration(duration)
+	if err != nil || config.Duration < 1000000000 {
+		return config, errors.New(fmt.Sprintf("Invalid test duration: %s\n", duration))
 	}
 	if sendDelay < 0 {
 		return config, errors.New(fmt.Sprintf("Invalid delay value: %d\n", sendDelay))
@@ -286,28 +124,44 @@ func ParseArgs() (Config, error) {
 }
 
 func main() {
-	config, error := ParseArgs()
-	if error != nil {
-		fmt.Print(error)
+	config, err := ParseArgs()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		os.Exit(1)
 	}
 
-	statSize := config.Count*config.Workers/config.MetricPerCon +
-		config.Count*config.Workers%config.MetricPerCon +
-		config.UCount*config.UWorkers + 1
-	bufSize := maxBuf
-	if statSize < maxBuf {
-		bufSize = statSize
+	if _, err := os.Stat(config.StatFile); err == nil || !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "file %s already exist\n", config.StatFile)
+		os.Exit(1)
 	}
 
-	wg.Add(config.Workers + config.UWorkers)
+	file, err := os.OpenFile(config.StatFile, os.O_CREATE|os.O_RDWR, 0777)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+		os.Exit(2)
+	}
+	defer file.Close()
+	w := bufio.NewWriter(file)
+	_, err = w.WriteString(header)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+		os.Exit(2)
+	}
 
-	result := make(chan Result, bufSize)
+	if config.CPUProf != "" {
+		f, err := os.Create(config.CPUProf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	result := make(chan ConStat, (config.Workers+config.UWorkers)*1000)
 	workers := config.Workers
 	uworkers := config.UWorkers
-	stat := make([]Result, statSize)
 
-	cb = NewCB(config.Workers + config.UWorkers + 1)
+	cb = cyclicbarrier.New(config.Workers + config.UWorkers + 1)
 
 	for i := 0; i < config.Workers; i++ {
 		go TcpWorker(i, config, result)
@@ -316,52 +170,85 @@ func main() {
 		go UDPWorker(i, config, result)
 	}
 
-	start := time.Now()
-	cb.Await()
-	log.Printf("Starting TCP workers: %d, UDP %d\n", config.Workers, config.UWorkers)
+	//start := time.Now()
+	go func() {
+		time.Sleep(config.Duration)
+		log.Printf("Shutting down")
+		running = false
+	}()
 
-	con := 0
-	ucon := 0
-	var (
-		duration  time.Duration
-		uduration time.Duration
-	)
+	var stat = map[Proto]map[NetOper]map[NetErr]int64{}
+
+	start := time.Now()
+
+	log.Printf("Starting TCP workers: %d, UDP %d\n", config.Workers, config.UWorkers)
+	cb.Await()
 
 LOOP:
 	for {
 		select {
 		case r := <-result:
-			if r.Connect.Time == 0 {
-				if r.Tcp {
+			if r.TimeStamp == 0 {
+				if r.Proto == TCP {
 					workers--
-					if workers == 0 {
-						duration = time.Since(start)
-					}
+					//if workers == 0 {
+					//duration = time.Since(start)
+					//}
 				} else {
 					uworkers--
-					if uworkers == 0 {
-						uduration = time.Since(start)
-					}
+					//if uworkers == 0 {
+					//uduration = time.Since(start)
+					//}
 				}
 				if workers <= 0 && uworkers <= 0 {
 					break LOOP
 				}
 			} else {
-				stat[con+ucon] = r
-				if r.Tcp {
-					con++
+				fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\t%d\t%d\n", r.TimeStamp/1000, r.Id,
+					ProtoToString(r.Proto), NetOperToString(r.Type),
+					NetErrToString(r.Error), r.Elapsed/1000, r.Size)
+
+				sProto, ok := stat[r.Proto]
+				if !ok {
+					sProto = map[NetOper]map[NetErr]int64{}
+					stat[r.Proto] = sProto
+				}
+				sOper, ok := sProto[r.Type]
+				if !ok {
+					sOper = map[NetErr]int64{}
+					sProto[r.Type] = sOper
+				}
+				_, ok = sOper[r.Error]
+				if !ok {
+					sOper[r.Error] = 1
 				} else {
-					ucon++
+					sOper[r.Error]++
 				}
 			}
 		}
 	}
-
-	tcpStat(stat, con, duration, config)
-
-	if uduration > 0 {
-		log.Printf("UDP Workers: %d, total send: %d / %.2f sec = %d rps",
-			config.UWorkers, ucon, float64(uduration)/float64(time.Second),
-			time.Duration(ucon)*time.Second/uduration)
+	duration := time.Since(start)
+	err = w.Flush()
+	if err != nil {
+		panic(err)
 	}
+	log.Printf("Shutdown, results writed to %s. Test duration %s", config.StatFile, duration)
+
+	// Print stat
+	for proto, opers := range stat {
+		for oper, errors := range opers {
+			for error, s := range errors {
+				fmt.Printf("%s.%s.%s %d (%d/s)\n", ProtoToString(proto), NetOperToString(oper), NetErrToString(error),
+					s, s/(duration.Nanoseconds()/1000000000))
+			}
+		}
+	}
+
+	//tcpStat(stat, con, duration, config)
+
+	//if duduration > 0 {
+	//log.Printf("UDP Workers: %d, total send: %d / %.2f sec = %d rps",
+	//config.UWorkers, ucon, float64(uduration)/float64(time.Second),
+	//time.Duration(ucon)*time.Second/uduration)
+	//}
 }
