@@ -2,11 +2,12 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"runtime/pprof"
@@ -29,6 +30,7 @@ type config struct {
 	Duration     time.Duration
 	MetricPerCon int
 	BatchSend    int
+	RateLimit    []int32
 	SendDelay    time.Duration
 	ConTimeout   time.Duration
 	SendTimeout  time.Duration
@@ -54,6 +56,7 @@ func ParseArgs() (config, error) {
 		port        int
 		duration    string
 		err         error
+		rateLimit   string
 	)
 
 	flag.StringVar(&host, "host", "127.0.0.1", "hostname")
@@ -68,6 +71,7 @@ func ParseArgs() (config, error) {
 	//flag.IntVar(&config.UBatchSend, "ubatch", 1, "send metric count in one UDP send")
 	flag.StringVar(&config.MetricPrefix, "prefix", "test", "metric prefix")
 
+	flag.StringVar(&rateLimit, "rate", "", "rate limit, format: rate or minRate:maxRate:increment ")
 	flag.IntVar(&sendDelay, "delay", 0, "send delay (ms)")
 
 	flag.BoolVar(&config.Verbose, "verbose", false, "verbose")
@@ -81,13 +85,13 @@ func ParseArgs() (config, error) {
 		host = "127.0.0.1"
 	}
 	if port < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid port value: %d\n", port))
+		return config, fmt.Errorf("Invalid port value: %d", port)
 	}
 	if config.Workers < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid TCP workers value: %d\n", config.Workers))
+		return config, fmt.Errorf("Invalid TCP workers value: %d", config.Workers)
 	}
 	if config.MetricPerCon < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid TCP metric value: %d\n", config.MetricPerCon))
+		return config, fmt.Errorf("Invalid TCP metric value: %d", config.MetricPerCon)
 	}
 	/*
 		if config.BatchSend < 1 {
@@ -95,20 +99,20 @@ func ParseArgs() (config, error) {
 		}
 	*/
 	if sendTimeout < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid TCP send timeout value: %d\n", sendTimeout))
+		return config, fmt.Errorf("Invalid TCP send timeout value: %d", sendTimeout)
 	}
 	if conTimeout < 1 {
-		return config, errors.New(fmt.Sprintf("Invalid TCP connection timeout value: %d\n", conTimeout))
+		return config, fmt.Errorf("Invalid TCP connection timeout value: %d", conTimeout)
 	}
 	if config.UWorkers < 0 {
-		return config, errors.New(fmt.Sprintf("Invalid UDP workers value: %d\n", config.Workers))
+		return config, fmt.Errorf("Invalid UDP workers value: %d", config.Workers)
 	}
 	config.Duration, err = time.ParseDuration(duration)
 	if err != nil || config.Duration < 1000000000 {
-		return config, errors.New(fmt.Sprintf("Invalid test duration: %s\n", duration))
+		return config, fmt.Errorf("Invalid test duration: %s", duration)
 	}
 	if sendDelay < 0 {
-		return config, errors.New(fmt.Sprintf("Invalid delay value: %d\n", sendDelay))
+		return config, fmt.Errorf("Invalid delay value: %d", sendDelay)
 	}
 
 	/*
@@ -120,6 +124,26 @@ func ParseArgs() (config, error) {
 	config.SendTimeout = time.Duration(sendTimeout) * time.Millisecond
 	config.ConTimeout = time.Duration(conTimeout) * time.Millisecond
 	config.SendDelay = time.Duration(sendDelay) * time.Millisecond
+
+	if rateLimit != "" {
+		rateS := strings.Split(rateLimit, ":")
+		if len(rateS) == 1 {
+			config.RateLimit = make([]int32, 1)
+			i, err := strconv.ParseInt(rateS[0], 10, 32)
+			if err != nil {
+				return config, fmt.Errorf("Invalid rate format: %s is not a number", rateS[0])
+			}
+			config.RateLimit[0] = int32(i)
+		} else if len(rateS) == 3 {
+			minRate, err := strconv.ParseInt(rateS[0], 10, 32)
+			maxRate, err := strconv.ParseInt(rateS[0], 10, 32)
+
+		} else {
+			return config, fmt.Errorf("Invalid rate format: %s", rateLimit)
+		}
+
+	}
+
 	return config, nil
 }
 
